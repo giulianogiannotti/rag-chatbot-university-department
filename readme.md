@@ -56,9 +56,9 @@ Después de este paso, Ollama ya tendrá el modelo disponible localmente.
 
 ## ▶️ Ejecución
 
-Si ya se configur Ollama y las dependencias, simplemente corre el proyecto:
+Si ya se configuro Ollama y las dependencias, simplemente corre el proyecto:
 
-python setup_and_run.py
+python setup_and_run.py o python3 setup_and_run.py 
 
 Esto iniciará **Streamlit** y podrás acceder al chatbot en tu navegador en la dirección:
 
