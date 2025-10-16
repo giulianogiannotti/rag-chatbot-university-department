@@ -26,13 +26,7 @@ Antes de ejecutar el chatbot, asegúrate de contar con lo siguiente:
 git clone https://github.com/tu-usuario/bot-resoluciones.git
 cd bot-resoluciones
 
-### 2. Instala dependencias
-
-El proyecto incluye un archivo `setup_and_run.py` que instala automáticamente los paquetes de `requirements.txt` y lanza la aplicación:
-
-python setup_and_run.py
-
-### 3. Configura Ollama y el modelo
+### 2. Configura Ollama y el modelo
 
 Antes de ejecutar el chatbot, necesitas descargar el modelo de lenguaje `gemma3:12b` en Ollama:
 
@@ -56,11 +50,11 @@ Después de este paso, Ollama ya tendrá el modelo disponible localmente.
 
 ## ▶️ Ejecución
 
-Si ya se configuro Ollama y las dependencias, simplemente corre el proyecto:
+Si ya se configuro Ollama, simplemente corre el proyecto:
 
 python setup_and_run.py o python3 setup_and_run.py 
 
-Esto iniciará **Streamlit** y podrás acceder al chatbot en tu navegador en la dirección:
+Esto descargará automáticamente las dependencias necesarias, iniciará **Streamlit** y podrás acceder al chatbot en tu navegador en la dirección:
 
 http://localhost:8501
 
