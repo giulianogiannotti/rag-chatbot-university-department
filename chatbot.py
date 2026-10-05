@@ -11,6 +11,7 @@ import unicodedata
 import subprocess
 from datetime import datetime
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 from docx import Document
@@ -54,6 +55,9 @@ MAX_LEN_PREGUNTA_REESCRITA = 300
 N_VARIANTES_QUERY = 3
 RECENCY_TIEBREAK_NEUTRO = 0.15
 MAX_LEN_VARIANTE = 200
+
+# Máximo de workers para paralelizar BM25 + FAISS por cada texto de búsqueda
+MAX_WORKERS_RETRIEVAL = 8
 
 
 def _detect_device() -> str:
@@ -789,6 +793,40 @@ class HybridRecencyRetriever:
         final = docs[1::2][::-1]
         return inicio + final
 
+    def _buscar_bm25_faiss_paralelo(
+        self,
+        textos_busqueda: list[str],
+    ) -> list[list[LCDocument]]:
+        """Lanza BM25 + FAISS para cada texto de búsqueda en paralelo con
+        threads (CAMBIO 4). El orden de los resultados se preserva para que
+        la fusión RRF sea determinística, igual que en la versión secuencial."""
+        tareas: list[tuple[str, str]] = []
+        for t in textos_busqueda:
+            tareas.append(("bm25", t))
+            tareas.append(("faiss", t))
+
+        rankings: list[Optional[list[LCDocument]]] = [None] * len(tareas)
+
+        def _ejecutar(idx: int, tipo: str, texto: str) -> tuple[int, list[LCDocument]]:
+            try:
+                if tipo == "bm25":
+                    return idx, self.bm25.invoke(texto)
+                return idx, self.faiss_retriever.invoke(texto)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Falló búsqueda %s para %r: %s", tipo, texto, e)
+                return idx, []
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_RETRIEVAL) as ex:
+            futures = [
+                ex.submit(_ejecutar, idx, tipo, texto)
+                for idx, (tipo, texto) in enumerate(tareas)
+            ]
+            for fut in futures:
+                idx, resultado = fut.result()
+                rankings[idx] = resultado
+
+        return [r if r is not None else [] for r in rankings]
+
     def get_relevant_documents(
         self,
         query: str,
@@ -814,10 +852,9 @@ class HybridRecencyRetriever:
             if vn and vn != q and vn not in textos_busqueda:
                 textos_busqueda.append(vn)
 
-        rankings: list[list[LCDocument]] = []
-        for t in textos_busqueda:
-            rankings.append(self.bm25.invoke(t))
-            rankings.append(self.faiss_retriever.invoke(t))
+        # CAMBIO 4: BM25 + FAISS de cada texto de búsqueda en paralelo
+        # (antes era un loop secuencial de invoke() por cada texto).
+        rankings = self._buscar_bm25_faiss_paralelo(textos_busqueda)
 
         fused = self._rrf_fusion(rankings)
         fused = self._rerank_cross_encoder(q, fused)
@@ -913,11 +950,24 @@ hybrid = HybridRecencyRetriever(vectorstore, bm25_corpus, reranker)
 
 from langchain_ollama import OllamaLLM
 
+# Modelo grande: se usa ÚNICAMENTE para generar la respuesta final,
+# donde la calidad importa más.
 llm = OllamaLLM(
     model="gemma3:12b",
     temperature=0,
     num_ctx=8192,
     num_predict=700,
+)
+
+# CAMBIO 1: modelo chico/rápido para tareas auxiliares y mecánicas
+# (condensar pregunta con historial, generar variantes de búsqueda).
+# La respuesta final SIEMPRE se genera con `llm` (gemma3:12b), así que
+# la calidad de la respuesta no se ve afectada.
+llm_fast = OllamaLLM(
+    model="gemma3:4b",
+    temperature=0,
+    num_ctx=4096,
+    num_predict=200,
 )
 
 # Reescritura de la pregunta con historial, en español, preservando
@@ -947,14 +997,17 @@ def condensar_pregunta(
 ) -> Optional[str]:
     """Genera la versión autocontenida de la pregunta usando el historial.
     Devuelve None si no hay historial o si la reescritura falla la
-    validación (en ese caso se busca solo con la pregunta original)."""
+    validación (en ese caso se busca solo con la pregunta original).
+
+    CAMBIO 1: usa `llm_fast` en vez del modelo de 12B, porque es una tarea
+    mecánica de reescritura que no necesita razonamiento profundo."""
     if not chat_history:
         return None
     historial = "\n".join(
         f"Usuario: {q}\nAsistente: {a[:400]}" for q, a in chat_history
     )
     try:
-        out = llm.invoke(
+        out = llm_fast.invoke(
             CONDENSE_TEMPLATE.format(historial=historial, pregunta=query)
         ).strip().strip('"')
     except Exception as e:  # noqa: BLE001
@@ -1018,9 +1071,12 @@ def generar_variantes_query(query: str, n: int = N_VARIANTES_QUERY) -> list[str]
     """Pide al LLM N reformulaciones de la consulta. Cada una se usa como
     búsqueda adicional (BM25 + FAISS) y se fusiona con RRF. Si el LLM falla
     o devuelve basura, se devuelve [] y el sistema sigue funcionando igual
-    que sin multi-query."""
+    que sin multi-query.
+
+    CAMBIO 1: usa `llm_fast` en vez del modelo de 12B, porque generar
+    reformulaciones/sinónimos es una tarea mecánica, no de razonamiento."""
     try:
-        out = llm.invoke(MULTIQUERY_TEMPLATE.format(n=n, pregunta=query))
+        out = llm_fast.invoke(MULTIQUERY_TEMPLATE.format(n=n, pregunta=query))
     except Exception as e:  # noqa: BLE001
         logger.warning("Falló multi-query: %s", e)
         return []
@@ -1074,15 +1130,34 @@ RESPUESTA:"""
 
 def responder(query: str, chat_history: list[tuple[str, str]]):
     """Cadena RAG manual:
-    1. Reescribe la pregunta con historial si hay turnos previos.
-    2. Genera variantes multi-query sobre la pregunta autocontenida.
-    3. Recupera con la original + reescrita + variantes (fusión RRF).
-    4. Arma el contexto y consulta al LLM una sola vez.
+    1. Reescribe la pregunta con historial si hay turnos previos (llm_fast).
+    2. Genera variantes multi-query sobre la pregunta autocontenida
+       (llm_fast) — SALVO que la pregunta ya traiga un ID de resolución
+       explícito (CAMBIO 2): en ese caso el pineo por documento domina el
+       resultado y las variantes casi no aportan, así que se evita esa
+       llamada extra al LLM.
+    3. Recupera con la original + reescrita + variantes (fusión RRF,
+       BM25+FAISS en paralelo — CAMBIO 4).
+    4. Arma el contexto y consulta al LLM grande (gemma3:12b) una sola vez
+       para la respuesta final.
     """
     standalone = condensar_pregunta(query, chat_history)
     base = standalone or query
 
-    variantes = generar_variantes_query(base)
+    # CAMBIO 2: si ya hay un identificador de resolución explícito en la
+    # pregunta, el pineo por documento (_chunks_de_documento) ya asegura
+    # que se busque en esa resolución puntual. Generar variantes ahí no
+    # aporta prácticamente nada y cuesta una llamada completa al LLM.
+    ids_detectados = extraer_ids_de_query(base)
+    if ids_detectados:
+        logger.info(
+            "ID explícito detectado (%s) → se omite multi-query.",
+            ids_detectados,
+        )
+        variantes: list[str] = []
+    else:
+        variantes = generar_variantes_query(base)
+
     query_alts = ([standalone] if standalone else []) + variantes
 
     docs = hybrid.get_relevant_documents(query, query_alts=query_alts)
